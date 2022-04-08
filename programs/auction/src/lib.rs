@@ -1,22 +1,32 @@
+use std::mem::{
+    size_of
+};
+
 use anchor_lang::{
     prelude::*,
-    solana_program::clock::UnixTimestamp,
+    solana_program::{
+        clock::UnixTimestamp,
+        program::invoke,
+        system_instruction
+    }
 };
 
 declare_id!("Fg6PaFpoGXkYsidMpWTK6W2BeZ7FEfcYkg476zPFsLnS");
 
 #[program]
 pub mod auction {
+
     use super::*;
 
     /// Creates and initialize a new state of our program
     pub fn initialize(ctx: Context<Auction>, auction_duration: UnixTimestamp, initial_price: u64) -> Result<()> {
         let state = &mut ctx.accounts.state;
-        state.max_price = initial_price;
-        state.max_bidder = *ctx.accounts.initializer.key;
         state.initializer = *ctx.accounts.initializer.key;
         state.treasury = *ctx.accounts.treasury.key;
+        state.max_bidder = Pubkey::default();
+        state.max_price = initial_price;
         state.end_time = Clock::get()?.unix_timestamp + auction_duration;
+        state.open = true;
 
         Ok(())
     }
@@ -24,31 +34,52 @@ pub mod auction {
     /// Bid
     pub fn bid(ctx: Context<Bid>, amount: u64) -> Result<()> {
         let state = &mut ctx.accounts.state;
-        let buyer = &ctx.accounts.buyer;
-        let treasury = &ctx.accounts.treasury;
+        let buyer = &mut ctx.accounts.buyer;
 
+        // Is the auction still running?
+        if Clock::get()?.unix_timestamp >= state.end_time {
+            return Err(error!(Errors::Closed));
+        }
+
+        // Check if the bid is lower or equal compared to the current highest
         if amount <= state.max_price {
             return Err(error!(Errors::BidTooLow));
         }
 
-        if Clock::get()?.unix_timestamp >= state.end_time {
-            return Err(error!(Errors::Closed));
-        }
-        
-        if state.max_bidder == *buyer.key {
-            return Err(error!(Errors::AlreadyHighestBidder));
+        // In a case this was not a new bid we have to calculate the difference between an old and a new amount bidded
+        let offer = &mut ctx.accounts.offer;
+        let diff = amount.checked_sub(offer.amount);
+        if diff == None {
+            return Err(error!(Errors::InvalidOperation))
         }
 
-        **buyer.try_borrow_mut_lamports()? -= amount;
-        **treasury.try_borrow_mut_lamports()? += amount;
+        // Move lamports to the treasury
+        let treasury = &mut ctx.accounts.treasury;
+        invoke(
+            &system_instruction::transfer(
+                buyer.key,
+                treasury.key,
+                diff.unwrap()
+            ),
+            &[
+                buyer.to_account_info().clone(),
+                treasury.clone()
+            ]
+        )?;
 
+        // Update state with the new highest bidder and the new highest bid
         state.max_price = amount;
         state.max_bidder = *buyer.key;
 
-        let offer = &mut ctx.accounts.offer;
-        offer.price += amount;
+        // Update the offer price
+        let new_offer_price = offer.amount.checked_add(amount);
+        if new_offer_price == None {
+            return Err(error!(Errors::InvalidOperation))
+        }
+
+        // Update the offer for a possible refund
+        offer.amount = new_offer_price.unwrap();
         offer.bump = *ctx.bumps.get("offer").unwrap();
-        offer.buyer = *buyer.key;
 
         Ok(())
     }
@@ -58,16 +89,17 @@ pub mod auction {
     pub fn end_auction(ctx: Context<Finish>) -> Result<()> {
         let state = &mut ctx.accounts.state;
 
+        // Is the auction already closed?
         if Clock::get()?.unix_timestamp < state.end_time {
             return Err(error!(Errors::Open));
         }
 
-        let treasury = &ctx.accounts.treasury;
-        let initializer = &ctx.accounts.initializer;
-        **initializer.try_borrow_mut_lamports()? += state.max_price;
-        **treasury.try_borrow_mut_lamports()? -= state.max_price;
+        // Transfer lamports to the seller
+        **ctx.accounts.treasury.try_borrow_mut_lamports()? -= state.max_price;
+        **ctx.accounts.initializer.try_borrow_mut_lamports()? += state.max_price;
 
-        state.max_price = 0;
+        // Close the auction
+        state.open = false;
 
         Ok(())
     }
@@ -76,18 +108,19 @@ pub mod auction {
     /// the unsuccessfull bidders can claim their money back by calling this instruction
     pub fn refund(ctx: Context<Refund>) -> Result<()> {
         let state = &ctx.accounts.state;
-        let offer = &mut ctx.accounts.offer;
 
+        // Is the auction already closed?
         if Clock::get()?.unix_timestamp < state.end_time {
             return Err(error!(Errors::Open));
         }
-        
-        let treasury = &ctx.accounts.treasury;
-        let initializer = &ctx.accounts.buyer;
-        **initializer.try_borrow_mut_lamports()? += offer.price;
-        **treasury.try_borrow_mut_lamports()? -= offer.price;
 
-        offer.price = 0;
+        // Transfer lamports back to the bidder
+        let offer = &mut ctx.accounts.offer;
+        **ctx.accounts.treasury.try_borrow_mut_lamports()? -= offer.amount;
+        **ctx.accounts.buyer.try_borrow_mut_lamports()? += offer.amount;
+
+        // Set the remaining amount of lamports to pay out to zero
+        offer.amount = 0;
 
         Ok(())
     }
@@ -95,19 +128,20 @@ pub mod auction {
 
 #[derive(Accounts)]
 pub struct Auction<'info> {
-    /// State of our auction program (up to you)
     #[account(
         init,
         payer = initializer,
-        space = 8 + 42069
+        space = 8 + State::size()
     )]
     pub state: Account<'info, State>,
 
-    /// Account which holds tokens bidded by biders
-    #[account(owner = initializer.key())]
+    #[account(
+        init,
+        payer = initializer,
+        space = 0
+    )]
     pub treasury: AccountInfo<'info>,
 
-    /// Seller
     #[account(mut)]
     pub initializer: Signer<'info>,
 
@@ -116,20 +150,20 @@ pub struct Auction<'info> {
 
 #[derive(Accounts)]
 pub struct Bid<'info> {
-    #[account(mut, has_one = treasury @ Errors::WrongOwner)]
-    pub state: Account<'info, State>,
-
-    #[account(address = state.treasury)]
-    pub treasury: AccountInfo<'info>,
-
     #[account(
-        init,
+        init_if_needed,
         payer = buyer,
-        space = 8 + 42069,
-        seeds = [b"bid", buyer.key().as_ref()],
-        bump
+        space = 8 + Offer::size(),
+        seeds = [b"bid", state.key().as_ref(), buyer.key().as_ref()],
+        bump,
     )]
     pub offer: Account<'info, Offer>,
+
+    #[account(mut, has_one = treasury @ Errors::WrongAccount)]
+    pub state: Account<'info, State>,
+
+    #[account(mut, address = state.treasury @ Errors::WrongAccount)]
+    pub treasury: AccountInfo<'info>,
 
     #[account(mut)]
     pub buyer: Signer<'info>,
@@ -139,54 +173,92 @@ pub struct Bid<'info> {
 
 #[derive(Accounts)]
 pub struct Finish<'info> {
-    #[account(mut, has_one = initializer @ Errors::WrongOwner, has_one = treasury @ Errors::WrongOwner)]
+    #[account(
+        mut,
+        has_one = initializer @ Errors::WrongAccount,
+        has_one = treasury @ Errors::WrongAccount,
+        has_one = max_bidder @ Errors::WrongAccount,
+        constraint = state.open @ Errors::Open
+    )]
     pub state: Account<'info, State>,
 
-    #[account(address = state.initializer)]
+    #[account(mut, address = state.initializer @ Errors::WrongAccount)]
     pub initializer: Signer<'info>,
 
-    #[account(address = state.treasury)]
+    #[account(mut, address = state.treasury @ Errors::WrongAccount)]
     pub treasury: AccountInfo<'info>,
+
+    #[account(mut, address = state.max_bidder @ Errors::WrongAccount)]
+    pub max_bidder: AccountInfo<'info>,
+
+    #[account(
+        mut,
+        address = state.max_bidder @ Errors::WrongAccount,
+        seeds = [b"bid", state.key().as_ref(), max_bidder.key.as_ref()],
+        bump = max_bid.bump,
+        close = max_bidder
+    )]
+    pub max_bid: Account<'info, Offer>,
 
     pub system_program: Program<'info, System>,
 }
 
 #[derive(Accounts)]
 pub struct Refund<'info> {
-    #[account(mut, has_one = treasury @ Errors::WrongOwner)]
+    #[account(
+        has_one = treasury @ Errors::WrongAccount,
+        constraint = !state.open @ Errors::Open
+    )]
     pub state: Account<'info, State>,
 
-    #[account(address = state.treasury)]
+    #[account(mut, address = state.treasury @ Errors::WrongAccount)]
     pub treasury: AccountInfo<'info>,
-
-    #[account(
-        mut,
-        seeds = [b"bid", offer.buyer.as_ref()],
-        bump
-    )]
-    pub offer: Account<'info, Offer>,
 
     #[account(mut)]
     pub buyer: Signer<'info>,
+
+    #[account(
+        mut,
+        seeds = [b"bid", state.key().as_ref(), buyer.key.as_ref()],
+        bump = offer.bump,
+        close = buyer
+    )]
+    pub offer: Account<'info, Offer>,
 
     pub system_program: Program<'info, System>,
 }
 
 #[account]
 pub struct State {
-    pub open: bool,
-    pub max_price: u64,
-    pub max_bidder: Pubkey,
     pub initializer: Pubkey,
     pub treasury: Pubkey,
-    pub end_time: UnixTimestamp
+    pub max_bidder: Pubkey,
+    pub max_price: u64,
+    pub end_time: UnixTimestamp,
+    pub open: bool
+}
+
+impl State {
+    pub fn size() -> usize {
+        size_of::<Pubkey>() +
+        size_of::<Pubkey>() +
+        size_of::<Pubkey>() +
+        size_of::<u64>() +
+        size_of::<UnixTimestamp>() +
+        size_of::<bool>()
+    }
 }
 
 #[account]
 pub struct Offer {
-    pub price: u64,
-    pub buyer: Pubkey,
+    pub amount: u64,
     pub bump: u8,
+}
+
+impl Offer {
+    pub fn size() -> usize {
+        size_of::<u64>() +
+        size_of::<u8>() }
 }
 
 #[error_code]
@@ -197,12 +269,15 @@ pub enum Errors {
     #[msg("Already the highest bidder.")]
     AlreadyHighestBidder,
 
-    #[msg("Wrong owner.")]
-    WrongOwner,
+    #[msg("Wrong account.")]
+    WrongAccount,
+
+    #[msg("Auction is open.")]
+    Open,
 
     #[msg("Auction is closed.")]
     Closed,
 
-    #[msg("Auction is open.")]
-    Open,
+    #[msg("Invalid operation.")]
+    InvalidOperation,
 }
