@@ -135,6 +135,7 @@ pub struct Auction<'info> {
     )]
     pub state: Account<'info, State>,
 
+    /// CHECK:
     #[account(
         init,
         payer = initializer,
@@ -162,6 +163,7 @@ pub struct Bid<'info> {
     #[account(mut, has_one = treasury @ Errors::WrongAccount)]
     pub state: Account<'info, State>,
 
+    /// CHECK:
     #[account(mut, address = state.treasury @ Errors::WrongAccount)]
     pub treasury: AccountInfo<'info>,
 
@@ -185,9 +187,11 @@ pub struct Finish<'info> {
     #[account(mut, address = state.initializer @ Errors::WrongAccount)]
     pub initializer: Signer<'info>,
 
+    /// CHECK:
     #[account(mut, address = state.treasury @ Errors::WrongAccount)]
     pub treasury: AccountInfo<'info>,
 
+    /// CHECK:
     #[account(mut, address = state.max_bidder @ Errors::WrongAccount)]
     pub max_bidder: AccountInfo<'info>,
 
@@ -211,6 +215,7 @@ pub struct Refund<'info> {
     )]
     pub state: Account<'info, State>,
 
+    /// CHECK:
     #[account(mut, address = state.treasury @ Errors::WrongAccount)]
     pub treasury: AccountInfo<'info>,
 
