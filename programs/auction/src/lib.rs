@@ -1,6 +1,4 @@
-use std::mem::{
-    size_of
-};
+use std::mem::size_of;
 
 use anchor_lang::{
     prelude::*,
@@ -19,13 +17,18 @@ pub mod auction {
     use super::*;
 
     /// Creates and initialize a new state of our program
-    pub fn initialize(ctx: Context<Auction>, auction_duration: UnixTimestamp, initial_price: u64) -> Result<()> {
+    pub fn initialize(ctx: Context<Auction>, auction_duration: i64, initial_price: u64) -> Result<()> {
+        let end_time = Clock::get()?.unix_timestamp.checked_add(auction_duration);
+        if end_time == None {
+            return Err(error!(Errors::InvalidOperation));
+        }
+
         let state = &mut ctx.accounts.state;
         state.initializer = *ctx.accounts.initializer.key;
         state.treasury = *ctx.accounts.treasury.key;
         state.max_bidder = Pubkey::default();
         state.max_price = initial_price;
-        state.end_time = Clock::get()?.unix_timestamp + auction_duration;
+        state.end_time = end_time.unwrap();
         state.open = true;
 
         Ok(())
@@ -239,7 +242,7 @@ pub struct State {
     pub treasury: Pubkey,
     pub max_bidder: Pubkey,
     pub max_price: u64,
-    pub end_time: UnixTimestamp,
+    pub end_time: i64,
     pub open: bool
 }
 
