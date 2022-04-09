@@ -23,6 +23,9 @@ pub mod auction {
             return Err(error!(Errors::InvalidOperation));
         }
 
+        let x = Clock::get()?.unix_timestamp;
+        msg!("{x}", x = x);
+
         let state = &mut ctx.accounts.state;
         state.initializer = *ctx.accounts.initializer.key;
         state.treasury = *ctx.accounts.treasury.key;
@@ -47,6 +50,11 @@ pub mod auction {
         // Check if the bid is lower or equal compared to the current highest
         if amount <= state.max_price {
             return Err(error!(Errors::BidTooLow));
+        }
+
+        // Don't allow increasing the bid for the highest bidder
+        if *buyer.key == state.max_bidder {
+            return Err(error!(Errors::AlreadyHighestBidder));
         }
 
         // In a case this was not a new bid we have to calculate the difference between an old and a new amount bidded
@@ -198,15 +206,6 @@ pub struct Finish<'info> {
     #[account(mut, address = state.max_bidder @ Errors::WrongAccount)]
     pub max_bidder: AccountInfo<'info>,
 
-    #[account(
-        mut,
-        address = state.max_bidder @ Errors::WrongAccount,
-        seeds = [b"bid", state.key().as_ref(), max_bidder.key.as_ref()],
-        bump = max_bid.bump,
-        close = max_bidder
-    )]
-    pub max_bid: Account<'info, Offer>,
-
     pub system_program: Program<'info, System>,
 }
 
@@ -214,7 +213,8 @@ pub struct Finish<'info> {
 pub struct Refund<'info> {
     #[account(
         has_one = treasury @ Errors::WrongAccount,
-        constraint = !state.open @ Errors::Open
+        constraint = !state.open @ Errors::Open,
+        constraint = state.max_bidder != *buyer.key @ Errors::WinnerRefund
     )]
     pub state: Account<'info, State>,
 
@@ -271,21 +271,24 @@ impl Offer {
 
 #[error_code]
 pub enum Errors {
-    #[msg("Bid offer too low.")]
+    #[msg("Bid offer too low")]
     BidTooLow,
 
-    #[msg("Already the highest bidder.")]
+    #[msg("Already the highest bidder")]
     AlreadyHighestBidder,
 
-    #[msg("Wrong account.")]
+    #[msg("Wrong account")]
     WrongAccount,
 
-    #[msg("Auction is open.")]
+    #[msg("Auction is open")]
     Open,
 
-    #[msg("Auction is closed.")]
+    #[msg("Auction is closed")]
     Closed,
 
-    #[msg("Invalid operation.")]
+    #[msg("Invalid operation")]
     InvalidOperation,
+
+    #[msg("Winner can not refund")]
+    WinnerRefund,
 }
